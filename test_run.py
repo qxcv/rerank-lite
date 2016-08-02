@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Unit tests for the reranker. Run these with py.test."""
 
-import numpy as np
+from os import path
 
-from run import unobjectify
+import pytest
+
+from run import PoseDataset
+
+MPII_DATA_ROOT = 'data/'
+MPII_JSON_PATH = path.join(MPII_DATA_ROOT, 'mpii_human_pose_v1_u12_1.json')
 
 
-def test_unobjectify():
-    real_data = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]
-    # Yup, constructing these arrays is actually really hard
-    obj_array = np.ndarray((4, 3), dtype='object')  # yapf: disable
-    for idx in range(len(real_data)):
-        obj_array[idx] = np.array(real_data[idx], dtype='uint8')
-    as_u8 = unobjectify(obj_array)
-    assert as_u8.shape == (4, 3)
-    assert np.all(as_u8 == np.array(real_data))
+@pytest.mark.skipif(not path.exists(MPII_JSON_PATH),
+                    reason='need MPII data to test dataset loading')
+def test_dataset():
+    dataset = PoseDataset(MPII_DATA_ROOT)
+    annots = dataset[...]
+    train_inds = dataset.train_indices()
+    test_inds = dataset.test_indices()
+    assert len(annots) == len(train_inds) + len(test_inds)

@@ -59,36 +59,6 @@ def build_model(input_shape: Tuple[int, ...], num_classes: int) -> Sequential:
     return model
 
 
-def unobjectify(obj_array: np.ndarray) -> np.ndarray:
-    """Turns a Numpy object array of arrays with some particular dtype into one
-    homogeneous array."""
-    # TODO: Do I need this anymore? Now that I'm not manipulating loaded .mat
-    # files, it shouldn't matter a great deal
-    assert obj_array.dtype.name == 'object'
-    if obj_array.size == 0:
-        return np.array([])
-
-    # Define shape and data type for new array based on its first element
-    chosen_elem = obj_array.flat[0]
-    if isinstance(chosen_elem, np.ndarray):
-        new_shape = obj_array.shape + chosen_elem.shape
-        new_dtype = chosen_elem.dtype
-    else:
-        # We have an array of (homogeneous?) scalars
-        new_shape = obj_array.shape
-        new_dtype = type(chosen_elem)
-
-    # Now construct the array and fill it out index-by-index
-    return_value = np.ndarray(shape=new_shape, dtype=new_dtype)
-    orig_iter = np.nditer(obj_array, flags=['refs_ok', 'multi_index'])
-    while not orig_iter.finished:
-        indices = orig_iter.multi_index
-        return_value[indices, ...] = orig_iter[0]
-        orig_iter.iternext()
-
-    return return_value
-
-
 def transpose_objects(objlist):
     """Turn a list of dictionaries into a dictionary with list values."""
     keys = objlist[0].keys()
@@ -113,12 +83,6 @@ class PoseDataset:
 
         # Mask telling us whether sample is used for training or not
         self._train_mask = np.array(loaded_json['img_train']) != 0
-
-        # Not going to bother with this for now
-        # flat_sp = loaded_json['single_person']
-        # for idx in range(len(flat_sp)):
-        #     flat_sp[idx] = flat_sp[idx].flatten()
-        # self._single_person = flat_sp
 
         # Load the actual annotations for each datum
         processed_annos = []
@@ -190,10 +154,12 @@ class PoseDataset:
         return self._annotations[key]
 
     def train_indices(self) -> np.ndarray:
-        return np.nonzero(self._train_mask)
+        rv, = np.nonzero(self._train_mask)
+        return rv
 
     def test_indices(self) -> np.ndarray:
-        return np.nonzero(~self._train_mask)
+        rv, = np.nonzero(~self._train_mask)
+        return rv
 
 
 parser = ArgumentParser(
