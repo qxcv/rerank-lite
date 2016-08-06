@@ -2,20 +2,21 @@
 """Main script to train model and run experiments."""
 
 from argparse import ArgumentParser
-from collections import namedtuple
 from json import load as load_json
 from logging import debug, info
 from os import path
-from typing import Dict, List, TypeVar, Union, Any, Iterator, Tuple, Optional
+from random import shuffle
+from typing import Any, Dict, List, TypeVar, Union, Iterator, Tuple, Optional
 
 import numpy as np  # type: ignore
 from scipy.ndimage import imread  # type: ignore
 from scipy.misc import imresize  # type: ignore
 from keras.models import Sequential  # type: ignore
 from keras.layers.core import Dense, Flatten, Dropout  # type: ignore
-from keras.layers.convolutional import (Convolution2D,
+from keras.layers.convolutional import (Convolution2D,  # type: ignore
                                         MaxPooling2D)  # type: ignore
 
+Any  # XXX: Getting rid of annoying unused var warning
 K = TypeVar('K')
 V = TypeVar('V')
 T = TypeVar('T')
@@ -30,6 +31,7 @@ def crop_patch(image: np.ndarray,
     """Crops a patch out an image, padding with the boundary value if
     necessary. ``mode`` takes on the same values as ``numpy.pad``'s ``mode``
     keyword argument."""
+    assert width >= 1 and height >= 1
     assert image.ndim >= 2
 
     top = int(center_y - height / 2)
@@ -150,12 +152,14 @@ class PersonRect:
     def _get_idx(self, joint: str) -> int:
         """Return an index into self.point for the given joint"""
         joint_id = MPII_JOINT_INDICES[joint]
-        return np.nonzero(self.point['id'] == joint_id)[0]
+        correct_id = int(np.nonzero(self.point['id'] == joint_id)[0])
+        return correct_id
 
     def joint_xy(self, joint: str) -> np.ndarray:
         """Get [x, y] location of a named joint"""
         joint_idx = self._get_idx(joint)
-        return np.array(self.point['x'][joint_idx], self.point['y'][joint_idx])
+        return np.array(
+            [self.point['x'][joint_idx], self.point['y'][joint_idx]])
 
     def joint_vis(self, joint: str) -> Optional[bool]:
         """Return whether named joint is visible"""
@@ -264,7 +268,9 @@ class PoseDataset:
         debug('MPII data load successful, got %i annotations',
               len(self._annotations))
 
-    def __getitem__(self, key: Any) -> Union[np.ndarray, DatumAnnotation]:
+    def __getitem__(
+            self, key:
+            Union[int, np.ndarray]) -> Union[np.ndarray, DatumAnnotation]:
         return self._annotations[key]
 
     @property
@@ -289,13 +295,13 @@ class MaxIterExceeded(Exception):
 
 
 def random_box(shape: Tuple[int, int],
+               box_side: int,
                people: List[PersonRect],
                max_iter=1000) -> List[float]:
     """Return a random box which doesn't (significantly) intersect any labelled
     person's joints. Returns ``[x, y, w, h]`` for the chosen box."""
     # Width and height of image, size of box to be returned
     height, width = shape
-    box_side = np.mean([p.scale for p in people])
 
     points = np.concatenate([p.point for p in people])
     # reshape for broadcasting with chosen_y
@@ -320,9 +326,24 @@ def random_box(shape: Tuple[int, int],
     return [return_x, return_y, box_side, box_side]
 
 
-DatumSpec = namedtuple(
-    'DatumSpec',
-    ['dataset_index', 'person_index', 'is_foreground', 'joint_name'])
+class DatumSpec:
+    def __init__(self,
+                 dataset_index: int,
+                 is_foreground: bool,
+                 person_index: Optional[int]=None,
+                 joint_name: Optional[str]=None) -> None:
+        assert isinstance(dataset_index, int)
+        assert isinstance(is_foreground, bool)
+        self.dataset_index = dataset_index
+        self.is_foreground = is_foreground
+        if self.is_foreground:
+            assert isinstance(joint_name, str)
+            assert isinstance(person_index, int)
+        else:
+            assert joint_name is None
+            assert person_index is None
+        self.person_index = person_index
+        self.joint_name = joint_name
 
 
 def fetch_datum(dataset: PoseDataset, spec:
@@ -336,14 +357,14 @@ def fetch_datum(dataset: PoseDataset, spec:
         person_rect = datum.people[spec.person_index]
         joint_xy = person_rect.joint_xy(spec.joint_name)
         # On a 200px tall person, the cropped boxes would be 25px to a side
-        box_side = 25 * person_rect.scale
-        crop_box = [joint_xy[0], joint_xy[1], box_side, box_side]
+        box_side = int(25 * person_rect.scale)
+        crop_box = [int(joint_xy[0]), int(joint_xy[1]), box_side, box_side]
     else:
         # Select a background crop. TODO: more robust way of getting
         # person-free crops
         label = np.array([1, 0])
-        box_side = 25 * np.mean([rect.scale for rect in datum.people])
-        crop_box = random_box(image.shape[:2], datum.people)
+        box_side = int(25 * np.mean([rect.scale for rect in datum.people]))
+        crop_box = random_box(image.shape[:2], box_side, datum.people)
 
     cropped_image = crop_patch(image, *crop_box)
     scaled_image = imresize(cropped_image, (224, 224))
@@ -354,8 +375,29 @@ def fetch_datum(dataset: PoseDataset, spec:
 def infinishuffle(data: List[T]) -> Iterator[T]:
     """Keep shuffling a data array forever, yielding each element in the array
     in seqeuence each time it is shuffled."""
+    # Make copy so that we can shuffle in-place
+    to_shuf = list(data)
     while True:
-        yield from np.random.permutation(data)
+        shuffle(to_shuf)
+        yield from to_shuf
+
+
+def valid_frame(datum: DatumAnnotation) -> bool:
+    """Check that a ``DatumAnnotation`` is for a frame that contains people,
+    each of whom has a scale."""
+    people = datum.people
+
+    # Make sure there are people in the frame
+    if not people:
+        return False
+
+    # Make sure that every person has a scale
+    for person in people:
+        if person.scale is None:
+            break
+    else:
+        return True
+    return False
 
 
 def fg_spec_generator(dataset: PoseDataset, accepted_inds:
@@ -363,10 +405,12 @@ def fg_spec_generator(dataset: PoseDataset, accepted_inds:
     """Generate transformation specs for foreground patches."""
     ind_pairs = []  # type: List[Tuple[int, int, str]]
     for ds_idx in accepted_inds:
+        if not valid_frame(dataset[ds_idx]):
+            continue
         for person_idx, person_rect in enumerate(dataset[ds_idx].people):
             for joint_id in person_rect.point['id']:
                 joint_name = MPII_JOINT_NAMES[joint_id]
-                ind_pairs.append((ds_idx, person_idx, joint_name))
+                ind_pairs.append((int(ds_idx), int(person_idx), joint_name))
 
     random_inds = infinishuffle(ind_pairs)
 
@@ -380,9 +424,11 @@ def fg_spec_generator(dataset: PoseDataset, accepted_inds:
 def bg_spec_generator(dataset: PoseDataset, accepted_inds:
                       np.ndarray) -> Iterator[DatumSpec]:
     """Generate transformation specs for background patches."""
-    inds = infinishuffle(accepted_inds)
+    inds = infinishuffle(list(accepted_inds))
     for ind in inds:
-        yield DatumSpec(dataset_index=ind,
+        if not valid_frame(dataset[ind]):
+            continue
+        yield DatumSpec(dataset_index=int(ind),
                         person_index=None,
                         is_foreground=False,
                         joint_name=None)
