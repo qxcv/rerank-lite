@@ -2,6 +2,7 @@
 """Main script to train model and run experiments."""
 
 from argparse import ArgumentParser
+from itertools import islice
 from json import load as load_json
 from logging import debug, info
 from os import path
@@ -104,7 +105,7 @@ def build_model(num_classes: int) -> Sequential:
     model.add(Dropout(0.5))
     model.add(Dense(4096, activation='relu'))
     model.add(Dropout(0.5))
-    model.add(Dense(1000, activation='softmax'))
+    model.add(Dense(num_classes, activation='softmax'))
 
     return model
 
@@ -368,8 +369,12 @@ def fetch_datum(dataset: PoseDataset, spec:
 
     cropped_image = crop_patch(image, *crop_box)
     scaled_image = imresize(cropped_image, (224, 224))
+    swapped_image = np.transpose(scaled_image, (2, 0, 1))
 
-    return (scaled_image, label)
+    # For some reason Keras wants (n, c, h, w) instead of (c, h, w)? I need to
+    # confirm that Keras is actually concatenating batches of data instead of
+    # just running one datum at a time through the network :P
+    return (swapped_image, label)
 
 
 def infinishuffle(data: List[T]) -> Iterator[T]:
@@ -447,7 +452,8 @@ def random_interleave(left: Iterator[T], right: Iterator[T], pleft:
 
 
 def data_generator(dataset: PoseDataset,  # yapf: disable
-                   is_train: bool) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+                   is_train: bool,
+                   batch_size: int) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
     """Generates ``(input, label)`` pairs for Keras, forever."""
     if is_train:
         # train data generator
@@ -458,8 +464,27 @@ def data_generator(dataset: PoseDataset,  # yapf: disable
     pos_generator = fg_spec_generator(dataset, accepted_inds)
     neg_generator = bg_spec_generator(dataset, accepted_inds)
     all_specs = random_interleave(pos_generator, neg_generator, 0.5)
-    for spec in all_specs:
-        yield fetch_datum(dataset, spec)
+    while True:
+        # Fetch a batch of data
+        specs = islice(all_specs, batch_size)
+        data = []
+        for spec in specs:
+            data.append(fetch_datum(dataset, spec))
+        assert len(data) == batch_size
+
+        # Determine output size
+        sample_input, sample_label = data[0]
+        final_input = np.zeros((batch_size,) + sample_input.shape)
+        final_label = np.zeros((batch_size,) + sample_label.shape)
+
+        # Concatenate the whole batch
+        for data_index in range(batch_size):
+            sample_input, sample_label = data[data_index]
+            final_input[data_index, ...] = sample_input
+            final_label[data_index, ...] = sample_label
+
+        # Yield for Keras to use
+        yield (final_input, final_label)
 
 
 parser = ArgumentParser(
@@ -476,6 +501,10 @@ parser.add_argument('--num_epochs',
                     default=100,
                     type=int,
                     help='number of epochs to train for')
+parser.add_argument('--batch_size',
+                    default=128,
+                    type=int,
+                    help='size of each batch')
 parser.add_argument(
     '--train_frac',
     default=0.8,
@@ -487,11 +516,8 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     dataset = PoseDataset(args.data_path, train_frac=args.train_frac)
-    train_gen = data_generator(dataset, True)
-    # valid_gen = data_generator(dataset, False)
-    # XXX: this is just for debugging the generator
-    for thing in train_gen:
-        print('Got something')
+    train_gen = data_generator(dataset, True, args.batch_size)
+    # valid_gen = data_generator(dataset, False, args.batch_size)
 
     model = build_model(num_classes=2)
     model.compile(optimizer='rmsprop',
