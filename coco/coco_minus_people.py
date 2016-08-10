@@ -62,6 +62,10 @@ class PersistentMapping:
 
 class Application:
     """Main class for the program. Handles all GTK events."""
+    # Maximum number of images to skip forward when looking for unlabelled
+    # images. Ensures that search for unlabelled images terminates in a
+    # reasonable amount of time.
+    MAX_SKIP = 500
 
     def __init__(self, image_dir, db):
         builder = Gtk.Builder()
@@ -72,6 +76,7 @@ class Application:
         self.filename_label = builder.get_object('datum_name')
         self.status_label = builder.get_object('status_label')
         self.label_combo = builder.get_object('label_combo')
+        self.skip_checkbutton = builder.get_object('skip_checkbutton')
 
         self.db = db
 
@@ -88,6 +93,9 @@ class Application:
         self.image_index = 0
 
         self.refresh_image()
+
+    def skip_labelled(self):
+        return self.skip_checkbutton.get_active()
 
     def redraw_image(self, *args):
         image_name = self.image_names[self.image_index]
@@ -107,7 +115,7 @@ class Application:
                            int(max_width / float(image_width) * image_height))
 
         pixbuf = pixbuf.scale_simple(scale_width, scale_height,
-                            GdkPixbuf.InterpType.BILINEAR)
+                                     GdkPixbuf.InterpType.BILINEAR)
 
         self.image_widget.set_from_pixbuf(pixbuf)
 
@@ -134,7 +142,26 @@ class Application:
         self.label_combo.set_active_id(gtk_label)
 
     def go_next(self):
-        self.image_index = min(self.image_index + 1, len(self.image_names) - 1)
+        new_index = None
+        if self.skip_labelled():
+            # just keep skipping forward until we find something; I don't have
+            # an intelligent way of doing this
+            for index_offset in range(1, self.MAX_SKIP + 1):
+                index = (self.image_index + index_offset) % len(self.image_names)
+                image_name = self.image_names[index]
+                try:
+                    if self.db[image_name] not in ['no_people', 'has_people']:
+                        new_index = index
+                        break
+                except KeyError:
+                    # no label, since self.db[index] check failed
+                    new_index = index
+                    break
+            if new_index is None:
+                logging.error("Couldn't find unlabelled frame in {} frames".format(self.MAX_SKIP))
+        if new_index is None:
+            new_index = min(self.image_index + 1, len(self.image_names) - 1)
+        self.image_index = new_index
         self.refresh_image()
 
     def go_prev(self):
