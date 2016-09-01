@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Main script to train model and run experiments."""
 
+from abc import ABCMeta, abstractmethod
 from argparse import ArgumentParser
-from itertools import islice
 from json import load as load_json
 from logging import debug, info
 from os import path
@@ -16,6 +16,8 @@ from keras.models import Sequential  # type: ignore
 from keras.layers.core import Dense, Flatten, Dropout  # type: ignore
 from keras.layers.convolutional import (Convolution2D,  # type: ignore
                                         MaxPooling2D)  # type: ignore
+
+from coco.coco import COCO
 
 Any  # XXX: Getting rid of annoying unused var warning
 K = TypeVar('K')
@@ -70,7 +72,7 @@ def build_model(num_classes: int) -> Sequential:
     """Build a simple classifier based on VGGNet, but with less pooling. You'll
     have to compile it yourself.
 
-    I might make this a simple renset later (e.g. resnet 34)."""
+    I might make this a simple resnet later (e.g. resnet 34)."""
     model = Sequential()
     model.add(Convolution2D(64,
                             3,
@@ -181,10 +183,33 @@ class DatumAnnotation:
         return 'DatumAnnotation({}, {})'.format(self.image_name, self.people)
 
 
-class PoseDataset:
+class BaseDataset(metaclass=ABCMeta):
+    @abstractmethod
+    def __getitem__(self, key: Union[int, np.ndarray]) -> \
+            Union[np.ndarray, DatumAnnotation]:
+        pass
+
+    @property
+    @abstractmethod
+    def split_train_indices(self) -> np.ndarray:
+        pass
+
+    @property
+    @abstractmethod
+    def split_val_indices(self) -> np.ndarray:
+        pass
+
+    @abstractmethod
+    def load_image(self, datum: DatumAnnotation) -> np.ndarray:
+        pass
+
+
+class PoseDataset(BaseDataset):
     """Encapsulating class for the entire MPII Human Pose dataset (for
     example). Each sample is identified by an integer corresponding to its
     position in the original data set."""
+
+    split_train_indices = split_val_indices = None
 
     def __init__(self, data_path: str, train_frac: float=1) -> None:
         """Load dataset from path"""
@@ -291,6 +316,47 @@ class PoseDataset:
         return imread(image_path)
 
 
+class NegativeDataset(BaseDataset):
+    """Simple wrapper around COCO dataset. Useful for finding images without
+    people."""
+    BAD_SUPERCATS = {'person'}
+
+    split_train_indices = split_val_indices = None
+
+    def __init__(self, data_path: str, train_frac: float=1) -> None:
+        coco_path = path.join(data_path, 'coco')
+        anno_path = path.join(coco_path,
+                              'annotations/instances_train2014.json')
+        self._frame_path = path.join(coco_path, 'Images/train2014/')
+        self._coco = COCO(anno_path)
+        all_good_ids = self._populate()
+        perm = np.random.permutation(all_good_ids)
+        num_train = int(train_frac * perm.size)
+        self.split_train_indices = perm[:num_train]
+        self.split_val_indices = perm[num_train:]
+        self._annotations = np.array([
+            DatumAnnotation(self._coco.imgs[iid]['file_name'], [])
+            for iid in all_good_ids
+        ])
+
+    def _populate(self) -> np.ndarray:
+        """Make cached list of person-free frames"""
+        good_cat_ids = []
+        for cat_id, cat_info in self._coco.cats.items():
+            if cat_info['supercategory'] not in self.BAD_SUPERCATS:
+                good_cat_ids.append(cat_id)
+        good_ids = self._coco.getImgIds(catIds=good_cat_ids)  # type: List[int]
+        return np.array(good_ids)
+
+    def __getitem__(self, key: Union[int, np.ndarray]) -> \
+            Union[np.ndarray, DatumAnnotation]:
+        return self._annotations[key]
+
+    def load_image(self, datum: DatumAnnotation) -> np.ndarray:
+        image_path = path.join(self._frame_path, datum.image_name)
+        return imread(image_path)
+
+
 class MaxIterExceeded(Exception):
     pass
 
@@ -329,12 +395,14 @@ def random_box(shape: Tuple[int, int],
 
 class DatumSpec:
     def __init__(self,
+                 dataset: BaseDataset,
                  dataset_index: int,
                  is_foreground: bool,
                  person_index: Optional[int]=None,
                  joint_name: Optional[str]=None) -> None:
         assert isinstance(dataset_index, int)
         assert isinstance(is_foreground, bool)
+        self.dataset = dataset
         self.dataset_index = dataset_index
         self.is_foreground = is_foreground
         if self.is_foreground:
@@ -347,27 +415,31 @@ class DatumSpec:
         self.joint_name = joint_name
 
 
-def fetch_datum(dataset: PoseDataset, spec:
-                DatumSpec) -> Tuple[np.ndarray, np.ndarray]:
+def fetch_datum(spec: DatumSpec) -> Tuple[np.ndarray, np.ndarray]:
     """Retrieve a single training sample from the dataset. Requires image
     loading, joint location, augmentation, etc."""
-    datum = dataset[spec.dataset_index]
-    image = dataset.load_image(datum)
+    datum = spec.dataset[spec.dataset_index]
+    image = spec.dataset.load_image(datum)
     if spec.is_foreground:
+        # Crop around some joint
         label = np.array([0, 1])
         person_rect = datum.people[spec.person_index]
         joint_xy = person_rect.joint_xy(spec.joint_name)
         # On a 200px tall person, the cropped boxes would be 25px to a side
         box_side = int(25 * person_rect.scale)
-        crop_box = [int(joint_xy[0]), int(joint_xy[1]), box_side, box_side]
+        box_x = int(joint_xy[0])
+        box_y = int(joint_xy[1])
     else:
-        # Select a background crop. TODO: more robust way of getting
-        # person-free crops
+        # Crop anywhere, since it's all background
+        assert len(datum.people) == 0, "Negatives can't have people, silly"
         label = np.array([1, 0])
-        box_side = int(25 * np.mean([rect.scale for rect in datum.people]))
-        crop_box = random_box(image.shape[:2], box_side, datum.people)
+        height, width = image.shape[:2]
+        min_dim = min(height, width)
+        box_side = int(np.random.randint(min(224, min_dim * 0.5), min_dim))
+        box_x = int(np.random.randint(0, width - box_side + 1))
+        box_y = int(np.random.randint(0, height - box_side + 1))
 
-    cropped_image = crop_patch(image, *crop_box)
+    cropped_image = crop_patch(image, box_x, box_y, box_side, box_side)
     scaled_image = imresize(cropped_image, (224, 224))
     swapped_image = np.transpose(scaled_image, (2, 0, 1))
 
@@ -420,20 +492,22 @@ def fg_spec_generator(dataset: PoseDataset, accepted_inds:
     random_inds = infinishuffle(ind_pairs)
 
     for ds_idx, person_idx, joint_name in random_inds:
-        yield DatumSpec(dataset_index=ds_idx,
+        yield DatumSpec(dataset=dataset,
+                        dataset_index=ds_idx,
                         person_index=person_idx,
                         is_foreground=True,
                         joint_name=joint_name)
 
 
-def bg_spec_generator(dataset: PoseDataset, accepted_inds:
-                      np.ndarray) -> Iterator[DatumSpec]:
+def bg_spec_generator(dataset: NegativeDataset, accepted_inds: np.ndarray) -> \
+        Iterator[DatumSpec]:
     """Generate transformation specs for background patches."""
     inds = infinishuffle(list(accepted_inds))
     for ind in inds:
         if not valid_frame(dataset[ind]):
             continue
-        yield DatumSpec(dataset_index=int(ind),
+        yield DatumSpec(dataset=dataset,
+                        dataset_index=int(ind),
                         person_index=None,
                         is_foreground=False,
                         joint_name=None)
@@ -450,10 +524,15 @@ def random_interleave(left: Iterator[T], right: Iterator[T], pleft:
         else:
             yield next(right)
 
+# Use of BatchIter is kind-of misleading, since the np.ndarrays will have
+# different dimensions for data points, as opposed to minibatches. Oh well.
+BatchIter = Iterator[Tuple[np.ndarray, np.ndarray]]
 
-def data_generator(dataset: PoseDataset,  # yapf: disable
-                   is_train: bool,
-                   batch_size: int) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+
+# yapf: disable
+def ds_data_generator(dataset: BaseDataset,
+                      is_train: bool) -> BatchIter:
+    # yapf: enable
     """Generates ``(input, label)`` pairs for Keras, forever."""
     if is_train:
         # train data generator
@@ -461,25 +540,34 @@ def data_generator(dataset: PoseDataset,  # yapf: disable
     else:
         # validation data generator
         accepted_inds = dataset.split_val_indices
-    pos_generator = fg_spec_generator(dataset, accepted_inds)
-    neg_generator = bg_spec_generator(dataset, accepted_inds)
-    all_specs = random_interleave(pos_generator, neg_generator, 0.5)
-    while True:
-        # Fetch a batch of data
-        specs = islice(all_specs, batch_size)
-        data = []
-        for spec in specs:
-            data.append(fetch_datum(dataset, spec))
-        assert len(data) == batch_size
+    if isinstance(dataset, PoseDataset):  # ugly
+        out_generator = fg_spec_generator(dataset, accepted_inds)
+    else:
+        assert isinstance(dataset, NegativeDataset)
+        out_generator = bg_spec_generator(dataset, accepted_inds)
+    yield from map(fetch_datum, out_generator)
 
-        # Determine output size
-        sample_input, sample_label = data[0]
-        final_input = np.zeros((batch_size,) + sample_input.shape)
-        final_label = np.zeros((batch_size,) + sample_label.shape)
+
+def batch_interleaver(batch_size: int, left: BatchIter, right: BatchIter,
+                      pleft: float) -> BatchIter:
+    """Interleave two data generators. Useful when you have generators for
+    individual positive and negative samples, but want to mix the two to
+    generate actual mini-batches for Keras."""
+
+    # throw away the first datum just to get image/label size
+    example_input, example_label = next(left)
+    input_size = (batch_size, ) + example_input.shape
+    label_size = (batch_size, ) + example_label.shape
+
+    all_data = random_interleave(left, right, pleft)
+
+    while True:
+        final_input = np.zeros(input_size)
+        final_label = np.zeros(label_size)
 
         # Concatenate the whole batch
         for data_index in range(batch_size):
-            sample_input, sample_label = data[data_index]
+            sample_input, sample_label = next(all_data)
             final_input[data_index, ...] = sample_input
             final_label[data_index, ...] = sample_label
 
@@ -515,8 +603,11 @@ if __name__ == '__main__':
     np.random.seed(0)
     args = parser.parse_args()
 
-    dataset = PoseDataset(args.data_path, train_frac=args.train_frac)
-    train_gen = data_generator(dataset, True, args.batch_size)
+    pos_dataset = PoseDataset(args.data_path, train_frac=args.train_frac)
+    neg_dataset = NegativeDataset(args.data_path, train_frac=args.train_frac)
+    pos_gen = ds_data_generator(pos_dataset, is_train=True)
+    neg_gen = ds_data_generator(neg_dataset, is_train=True)
+    train_gen = batch_interleaver(args.batch_size, pos_gen, neg_gen, 0.5)
     # valid_gen = data_generator(dataset, False, args.batch_size)
 
     model = build_model(num_classes=2)
