@@ -34,11 +34,12 @@ def crop_patch(image: np.ndarray,
     """Crops a patch out an image, padding with the boundary value if
     necessary. ``mode`` takes on the same values as ``numpy.pad``'s ``mode``
     keyword argument."""
-    assert width >= 1 and height >= 1
+    assert width >= 1 and height >= 1, "Box is empty"
     assert image.ndim >= 2
 
     top = int(center_y - height / 2)
     top_b = max(top, 0)
+    assert top_b < image.shape[0], "Box is outside frame"
     top_pad = top_b - top
     assert top_pad >= 0
 
@@ -49,6 +50,7 @@ def crop_patch(image: np.ndarray,
 
     left = int(center_x - width / 2)
     left_b = max(left, 0)
+    assert left_b < image.shape[1], "Box is outside frame"
     left_pad = left_b - left
     assert left_pad >= 0
 
@@ -57,8 +59,8 @@ def crop_patch(image: np.ndarray,
     right_pad = right - right_b
     assert right_pad >= 0
 
-    sample = image[top_b:bot_b, left_b:right_b]
     assert bot_b > top_b and right_b > left_b, (top_b, bot_b, left_b, right_b)
+    sample = image[top_b:bot_b, left_b:right_b]
     pad_amounts = ((top_pad, bot_pad), (left_pad, right_pad))  # type: Any
     extra_dims = image.ndim - 2  # type: int
     pad_amounts += ((0, 0), ) * extra_dims
@@ -155,7 +157,9 @@ class PersonRect:
     def _get_idx(self, joint: str) -> int:
         """Return an index into self.point for the given joint"""
         joint_id = MPII_JOINT_INDICES[joint]
-        correct_id = int(np.nonzero(self.point['id'] == joint_id)[0])
+        # XXX: For some reason there are annotations where the same joint ID
+        # appears more than once (?!)
+        correct_id = int(np.nonzero(self.point['id'] == joint_id)[0][0])
         return correct_id
 
     def joint_xy(self, joint: str) -> np.ndarray:
@@ -276,8 +280,6 @@ class PoseDataset(BaseDataset):
 
                 people.append(rect)
 
-            # I kid you not, this was the easiest way of getting at the string
-            # contents
             image_name = datum_anno['image']['name']
             anno = DatumAnnotation(image_name=image_name, people=people)
             processed_annos.append(anno)
@@ -329,24 +331,28 @@ class NegativeDataset(BaseDataset):
                               'annotations/instances_train2014.json')
         self._frame_path = path.join(coco_path, 'Images/train2014/')
         self._coco = COCO(anno_path)
-        all_good_ids = self._populate()
-        perm = np.random.permutation(all_good_ids)
+        self._all_good_ids = self._populate()
+        perm = np.random.permutation(np.arange(len(self._all_good_ids)))
         num_train = int(train_frac * perm.size)
+        # split_*_indices are in [0, len(self._all_good_ids)); this ensures
+        # that we don't get out-of-range errors when we index into
+        # self._annotations later.
         self.split_train_indices = perm[:num_train]
         self.split_val_indices = perm[num_train:]
         self._annotations = np.array([
             DatumAnnotation(self._coco.imgs[iid]['file_name'], [])
-            for iid in all_good_ids
+            for iid in self._all_good_ids
         ])
 
     def _populate(self) -> np.ndarray:
         """Make cached list of person-free frames"""
-        good_cat_ids = []
+        bad_ids = set()
         for cat_id, cat_info in self._coco.cats.items():
-            if cat_info['supercategory'] not in self.BAD_SUPERCATS:
-                good_cat_ids.append(cat_id)
-        good_ids = self._coco.getImgIds(catIds=good_cat_ids)  # type: List[int]
-        return np.array(good_ids)
+            if cat_info['supercategory'] in self.BAD_SUPERCATS:
+                # Blacklist any images with something categorised as a person
+                bad_ids.update(self._coco.getImgIds(catIds=[cat_id]))
+        all_good = sorted(set(self._coco.getImgIds()) - bad_ids)
+        return np.array(all_good)
 
     def __getitem__(self, key: Union[int, np.ndarray]) -> \
             Union[np.ndarray, DatumAnnotation]:
@@ -414,6 +420,14 @@ class DatumSpec:
         self.person_index = person_index
         self.joint_name = joint_name
 
+    def __str__(self):
+        return 'DatumSpec(dataset={}, dataset_index={}, is_foreground={}, ' \
+            'person_index={}, joint_name={})'.format(self.dataset,
+                                                     self.dataset_index,
+                                                     self.is_foreground,
+                                                     self.person_index,
+                                                     self.joint_name)
+
 
 def fetch_datum(spec: DatumSpec) -> Tuple[np.ndarray, np.ndarray]:
     """Retrieve a single training sample from the dataset. Requires image
@@ -440,8 +454,18 @@ def fetch_datum(spec: DatumSpec) -> Tuple[np.ndarray, np.ndarray]:
         box_y = int(np.random.randint(0, height - box_side + 1))
 
     cropped_image = crop_patch(image, box_x, box_y, box_side, box_side)
+    assert cropped_image.shape[0] > 0 and cropped_image.shape[1] > 0
     scaled_image = imresize(cropped_image, (224, 224))
-    swapped_image = np.transpose(scaled_image, (2, 0, 1))
+    assert scaled_image.shape[0] == 224 and scaled_image.shape[1] == 224
+    assert 2 <= cropped_image.ndim <= 3
+    assert cropped_image.ndim == image.ndim
+    if cropped_image.ndim == 2:
+        # black and white image, so we duplicate intensity across 3
+        # channels
+        swapped_image = np.stack([scaled_image] * 3)
+    else:
+        # otherwise, we only need to move the R/G/B dimension to the front
+        swapped_image = np.transpose(scaled_image, (2, 0, 1))
 
     # For some reason Keras wants (n, c, h, w) instead of (c, h, w)? I need to
     # confirm that Keras is actually concatenating batches of data instead of
@@ -453,6 +477,7 @@ def infinishuffle(data: List[T]) -> Iterator[T]:
     """Keep shuffling a data array forever, yielding each element in the array
     in seqeuence each time it is shuffled."""
     # Make copy so that we can shuffle in-place
+    assert len(data) > 0, "Actually need something to yield"
     to_shuf = list(data)
     while True:
         shuffle(to_shuf)
@@ -487,7 +512,10 @@ def fg_spec_generator(dataset: PoseDataset, accepted_inds:
         for person_idx, person_rect in enumerate(dataset[ds_idx].people):
             for joint_id in person_rect.point['id']:
                 joint_name = MPII_JOINT_NAMES[joint_id]
-                ind_pairs.append((int(ds_idx), int(person_idx), joint_name))
+                # Only append visible pairs
+                if person_rect.joint_vis(joint_name):
+                    ind_pairs.append(
+                        (int(ds_idx), int(person_idx), joint_name))
 
     random_inds = infinishuffle(ind_pairs)
 
@@ -504,8 +532,6 @@ def bg_spec_generator(dataset: NegativeDataset, accepted_inds: np.ndarray) -> \
     """Generate transformation specs for background patches."""
     inds = infinishuffle(list(accepted_inds))
     for ind in inds:
-        if not valid_frame(dataset[ind]):
-            continue
         yield DatumSpec(dataset=dataset,
                         dataset_index=int(ind),
                         person_index=None,
@@ -581,8 +607,8 @@ parser.add_argument('--data_path',
                     default='data/',
                     type=str,
                     help='path to data folder')
-parser.add_argument('--epoch_length',
-                    default=1000,
+parser.add_argument('--epoch_batches',
+                    default=16,
                     type=int,
                     help='length of epochs (in batches)')
 parser.add_argument('--num_epochs',
@@ -617,7 +643,8 @@ if __name__ == '__main__':
 
     info('Fitting model')
     model.fit_generator(train_gen,
-                        args.epoch_length,
+                        # number of samples per epoch
+                        args.epoch_batches * args.batch_size,
                         args.num_epochs,
                         # validation_data=valid_gen,
                         nb_worker=1)
